@@ -18,13 +18,14 @@
 
 | 依赖 | 用途 | 必需 | 实测版本 | 最低要求 |
 |---|---|---|---|---|
-| Python 3 | 运行主程序 | ✅ 必需 | 3.14.4 | 3.8+（仅用标准库） |
+| Python 3 | 运行主程序 | ✅ 必需 | 3.14.4 | 3.10+（仅用标准库） |
 | Ghostscript（`gs`） | `--mode outline` 文字转矢量轮廓（`-dNoOutputFonts`） | ✅ 供 outline/auto/both | 10.08.0 | 9.55+（`-dPreserveAnnots` 参数） |
 | poppler：`pdftocairo` | `--mode image` 整页栅格化 | ✅ 供 image/auto/both | 26.11.0 | 0.60+ |
 | poppler：`pdftoppm` | 输出校验时渲染比对 | ✅ 校验用 | 26.11.0 | 0.60+ |
 | poppler：`pdffonts` | 字体诊断、类型错配检测 | ✅ 一直用 | 26.11.0 | 0.60+ |
 | poppler：`pdfinfo` | 页数 / 页面尺寸 | ✅ 一直用 | 26.11.0 | 0.60+ |
 | Pillow（PIL） | 校验时图片比对 | ⭕ 可选 | 12.2.0 | 8.0+ |
+| Python 版本策略 | — | — | — | 3.8/3.9 已 EOL，项目支持 3.10+；CI 覆盖 3.10/3.12 |
 | GNU make / bash | `make` 与测试脚本（开发/安装便利） | ⭕ 可选 | make 3.81 / bash 3.2 | — |
 | ImageMagick（`magick`） | Pillow 缺失时的比对后备 | ⭕ 可选 | — | 7.x |
 
@@ -48,7 +49,7 @@ brew install ghostscript poppler
 Python 用系统自带或 Homebrew 的即可：
 
 ```bash
-python3 --version        # 3.8+ 即可
+python3 --version        # 3.10+ 即可
 ```
 
 ### Ubuntu / Debian

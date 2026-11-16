@@ -26,7 +26,8 @@ def load_module():
     return pdf_normalize
 
 
-def make_pdf(declared_subtype, descriptor_slot, program_bytes, stream_subtype=None):
+def make_pdf(declared_subtype, descriptor_slot, program_bytes, stream_subtype=None,
+             subtype_sep=b"/", fontfile_sep=b" "):
     """拼一个结构完整的最小 PDF（含 type0 字体 + 字体程序流 + 正确 xref）。"""
     prog = zlib.compress(program_bytes)
     fontfile_dict = b"<</Filter/FlateDecode/Length %d/Length1 %d>>" % (len(prog), len(program_bytes))
@@ -41,12 +42,12 @@ def make_pdf(declared_subtype, descriptor_slot, program_bytes, stream_subtype=No
         4: b"<</Type/Font/Subtype/Type0/BaseFont/TestFont/Encoding/Identity-H"
            b"/DescendantFonts[6 0 R]>>",
         5: None,  # content stream
-        6: b"<</Type/Font/Subtype/" + declared_subtype + b"/BaseFont/TestFont"
+        6: b"<</Type/Font/Subtype" + subtype_sep + declared_subtype + b"/BaseFont/TestFont"
            b"/CIDSystemInfo 7 0 R/CIDToGIDMap/Identity/DW 1000/FontDescriptor 8 0 R>>",
         7: b"<</Registry(Adobe)/Ordering(Identity)/Supplement 0>>",
         8: b"<</Type/FontDescriptor/FontName/TestFont/Flags 4/Ascent 800/Descent -200"
            b"/CapHeight 700/ItalicAngle 0/StemV 80/FontBBox[0 -200 1000 800]/"
-           + descriptor_slot + b" 9 0 R>>",
+           + descriptor_slot + fontfile_sep + b"9 0 R>>",
         9: None,  # font program stream
     }
     content = b"q Q\n"
@@ -113,6 +114,135 @@ def test_truetype_in_cff_slot(mod, tmpdir):
     print("  ✓ TrueType 塞进 CFF 槽位 -> 正确修复")
 
 
+def test_whitespace_variants(mod, tmpdir):
+    """真实 PDF 常见 /Subtype /CIDFontType2、/FontFile2  9 0 R 等写法，必须同样修复。"""
+    variants = [
+        ("subtype 单空格", b" /", b" "),
+        ("subtype 双空格", b"  /", b"  "),
+        ("fontfile 换行", b"/", b"\n"),
+    ]
+    for name, st_sep, ff_sep in variants:
+        src = Path(tmpdir) / ("ws_%s.pdf" % name)
+        dst = Path(tmpdir) / ("ws_%s_fixed.pdf" % name)
+        src.write_bytes(make_pdf(b"CIDFontType2", b"/FontFile2", b"OTTO" + b"\x00" * 64,
+                                 subtype_sep=st_sep, fontfile_sep=ff_sep))
+        n, explain = mod.repair_font_declarations(src, dst)
+        out = dst.read_bytes()
+        assert n == 1, (name, explain)
+        assert b"/Subtype/CIDFontType0" in out, name
+        assert b"/FontFile3 9 0 R" in out, name
+        assert b"CIDFontType2" not in out, name
+        assert b"FontFile2" not in out, name
+        check_xref(out)
+        print("  ✓ 空白变体（%s）正确修复" % name)
+
+
+def test_xref_fallback_root(mod, tmpdir):
+    """没有传统 trailer（交叉引用流）时，应从 /Type/Catalog 兜底找到 Root。"""
+    data = make_pdf(b"CIDFontType2", b"/FontFile2", b"\x00\x01\x00\x00" + b"\x00" * 64)
+    body = data[:data.rfind(b"xref")]
+    objs = mod._find_objects(body)
+    out = mod._rebuild_xref(b"", body, objs)
+    assert b"/Root 1 0 R" in out
+    check_xref(out)
+    print("  ✓ 无 trailer 时 xref 重建可兜底 Root")
+
+
+def test_skip_verify_semantics(mod, tmpdir):
+    """--no-verify 的校验结果必须标记 skipped，而不是伪造 ok=true。"""
+    v = mod.skipped_verify()
+    assert v["skipped"] is True and v["ok"] is None and v["fonts"] is None
+    assert mod._verify_passed(v) is True
+    assert mod._verify_passed({"ok": True}) is True
+    assert mod._verify_passed({"ok": False}) is False
+    print("  ✓ --no-verify 语义：skipped 标记正确")
+
+
+def test_collect_inputs_suffix(mod, tmpdir):
+    """目录扫描：大小写 .PDF 都收，且按 --suffix 排除本工具产物。"""
+    d = Path(tmpdir) / "collect"
+    d.mkdir()
+    (d / "a.pdf").write_bytes(b"%PDF-1.4")
+    (d / "b.PDF").write_bytes(b"%PDF-1.4")
+    (d / "a-print.pdf").write_bytes(b"%PDF-1.4")
+    (d / "a-可打印.pdf").write_bytes(b"%PDF-1.4")
+    files, _ = mod.collect_inputs([d], False, "-可打印")
+    names = sorted(f.name for f in files)
+    assert names == ["a.pdf", "b.PDF"], names
+    print("  ✓ 目录扫描：.PDF 大小写兼容 + 自定义后缀排除")
+
+
+def test_magick_compare(mod, tmpdir):
+    """无 PIL 时 ImageMagick 后备必须同时得出均值与差异像素占比。"""
+    import shutil
+    import subprocess
+    if not shutil.which("magick"):
+        print("  - 跳过 ImageMagick 后备测试（未安装 magick）")
+        return
+    a = Path(tmpdir) / "a.png"
+    b = Path(tmpdir) / "b.png"
+    subprocess.run(["magick", "-size", "120x80", "xc:white", "-fill", "black",
+                    "-draw", "rectangle 10,10 60,60", str(a)], check=True)
+    subprocess.run(["magick", "-size", "120x80", "xc:white", "-fill", "black",
+                    "-draw", "rectangle 14,14 64,64", str(b)], check=True)
+    saved = sys.modules.get("PIL", "missing")
+    sys.modules["PIL"] = None  # 让 `from PIL import ...` 失败
+    try:
+        res = mod._compare([a], [b])
+    finally:
+        if saved == "missing":
+            sys.modules.pop("PIL", None)
+        else:
+            sys.modules["PIL"] = saved
+    assert res is not None
+    mean, pct = res
+    assert mean > 0 and pct > 0, res
+    print("  ✓ ImageMagick 后备：均值 %.2f / 差异像素 %.2f%%" % (mean, pct))
+
+
+def test_exit_codes(mod, tmpdir):
+    """退出码：全部因校验失败 -> 2；部分失败 -> 3。"""
+    import io
+    from contextlib import redirect_stdout
+
+    d = Path(tmpdir) / "exit"
+    d.mkdir()
+    pdf = d / "x.pdf"
+    pdf2 = d / "y.pdf"
+    pdf.write_bytes(b"%PDF-1.4")
+    pdf2.write_bytes(b"%PDF-1.4")
+
+    def fail_result(path, opts):
+        return {"input": str(path), "ok": False, "error": "校验未通过", "error_kind": "verify",
+                "outputs": [], "verify": None, "diagnosis": None}
+
+    def ok_result(path, opts):
+        return {"input": str(path), "ok": True, "error": "", "error_kind": "",
+                "outputs": [], "verify": None, "diagnosis": None}
+
+    saved = (mod.collect_inputs, mod.process_one)
+    try:
+        mod.collect_inputs = lambda *a, **k: ([pdf, pdf2], [])
+        mod.process_one = fail_result
+        with redirect_stdout(io.StringIO()):
+            rc = mod.main(["--mode", "outline", str(pdf), str(pdf2)])
+        assert rc == mod.EXIT_VERIFY, rc
+
+        calls = {"n": 0}
+
+        def mixed(path, opts):
+            calls["n"] += 1
+            return ok_result(path, opts) if calls["n"] == 1 else fail_result(path, opts)
+
+        mod.process_one = mixed
+        with redirect_stdout(io.StringIO()):
+            rc = mod.main(["--mode", "outline", str(pdf), str(pdf)])
+        assert rc == mod.EXIT_PARTIAL, rc
+    finally:
+        mod.collect_inputs, mod.process_one = saved
+    print("  ✓ 退出码：全校验失败=2，部分失败=3")
+
+
 def test_noop(mod, tmpdir):
     src = Path(tmpdir) / "ok.pdf"
     dst = Path(tmpdir) / "ok_fixed.pdf"
@@ -134,6 +264,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix="pdfnorm-test-") as td:
         test_cff_in_truetype_slot(mod, td)
         test_truetype_in_cff_slot(mod, td)
+        test_whitespace_variants(mod, td)
+        test_xref_fallback_root(mod, td)
+        test_skip_verify_semantics(mod, td)
+        test_collect_inputs_suffix(mod, td)
+        test_exit_codes(mod, td)
+        test_magick_compare(mod, td)
         test_noop(mod, td)
     print("单元测试全部通过")
     return 0

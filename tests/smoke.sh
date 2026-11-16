@@ -63,5 +63,34 @@ assert len(d["results"])==1
 say "--no-verify（快速模式）"
 "$BIN" --mode outline --no-verify -o "$TMP/nv" "$TMP/in.pdf" >/dev/null && ok "--no-verify" || bad "--no-verify 失败"
 
+say "--no-verify 在 JSON 中标记 skipped（不伪造 ok=true）"
+"$BIN" --json --no-verify -o "$TMP/nvj" "$TMP/in.pdf" 2>/dev/null | python3 -c '
+import json, sys
+v = json.load(sys.stdin)["results"][0]["verify"]
+assert v.get("skipped") is True, v
+assert v.get("fonts") is None, v
+assert v.get("ok") is None, v
+' && ok "no-verify 语义正确" || bad "no-verify 语义错误"
+
+say "大写 .PDF 扩展名"
+cp "$TMP/in.pdf" "$TMP/UPPER.PDF"
+"$BIN" --mode check "$TMP/UPPER.PDF" >/dev/null 2>&1 && ok "大写扩展名可识别" || bad "大写扩展名未识别"
+
+say "自定义 --suffix 二次运行幂等"
+"$BIN" --suffix=-可打印 -o "$TMP/sfx" "$TMP/in.pdf" >/dev/null 2>&1 || bad "自定义后缀首次运行失败"
+n=$("$BIN" --suffix=-可打印 --mode check --json -o "$TMP/sfx" "$TMP/in.pdf" 2>/dev/null     | python3 -c 'import json,sys; print(json.load(sys.stdin)["summary"]["total"])')
+[ "$n" = "1" ] && ok "自定义后缀产物未被再次处理（total=1）" || bad "自定义后缀幂等失败（total=$n）"
+
+say "加密 PDF + 环境变量密码"
+if gs -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -sOwnerPassword=owner -sUserPassword=user \
+      -dEncryptionR=3 -dKeyLength=128 -sOutputFile="$TMP/enc.pdf" "$TMP/in.pdf" 2>/dev/null; then
+  PDF_NORMALIZE_PASSWORD=user "$BIN" --mode outline -o "$TMP/enc" "$TMP/enc.pdf" >/dev/null 2>&1 \
+    && ok "环境变量密码可解锁并转换" || bad "环境变量密码失败"
+  "$BIN" --mode outline -o "$TMP/enc2" "$TMP/enc.pdf" >/dev/null 2>&1 \
+    && bad "无密码时不应成功" || ok "无密码时失败并提示"
+else
+  say "  - 当前 gs 不支持加密参数，跳过"
+fi
+
 if [ "$FAIL" = "0" ]; then say "冒烟测试通过"; else say "冒烟测试有失败项"; fi
 exit "$FAIL"

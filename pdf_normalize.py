@@ -41,9 +41,10 @@ import tempfile
 import zlib
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DEFAULT_DPI = 300
 DEFAULT_SUFFIX = "-print"
+PASSWORD_ENV = "PDF_NORMALIZE_PASSWORD"
 VERIFY_DPI = 110
 
 # 校验阈值：blur 后灰度差的均值 / 差异像素比例（>40/255）
@@ -114,11 +115,18 @@ def human_size(n):
 # --------------------------------------------------------------------------
 # PDF 信息读取
 # --------------------------------------------------------------------------
-def pdfinfo(path):
-    """读取 pdfinfo 的关键字段（字符串）。"""
-    rc, out, err = sh(["pdfinfo", str(path)])
+def pdfinfo(path, password=None):
+    """读取 pdfinfo 的关键字段（字符串）。加密 PDF 用 password 解锁。"""
+    cmd = ["pdfinfo"]
+    if password:
+        cmd += ["-upw", password]
+    cmd.append(str(path))
+    rc, out, err = sh(cmd)
     if rc != 0:
-        raise RuntimeError("pdfinfo 失败: %s" % (err.strip() or out.strip()))
+        msg = err.strip() or out.strip()
+        if "password" in msg.lower():
+            msg += "（该 PDF 已加密：用 --password 或环境变量 %s 提供密码）" % PASSWORD_ENV
+        raise RuntimeError("pdfinfo 失败: %s" % msg)
     info = {}
     for line in out.splitlines():
         if ":" in line and not line.startswith(" "):
@@ -135,9 +143,13 @@ def page_size_pt(info):
     return float(m.group(1)), float(m.group(2))
 
 
-def pdffonts_scan(path):
-    """返回 (字体行列表, 字体类型错配条数, 原始输出)。"""
-    rc, out, err = sh(["pdffonts", str(path)])
+def pdffonts_scan(path, password=None):
+    """返回 (字体行列表, 字体类型错配条数, 原始输出)。加密 PDF 用 password 解锁。"""
+    cmd = ["pdffonts"]
+    if password:
+        cmd += ["-upw", password]
+    cmd.append(str(path))
+    rc, out, err = sh(cmd)
     text = out + "\n" + err
     mismatch = text.count("Mismatch between font type and embedded font file")
     rows = []
@@ -149,9 +161,9 @@ def pdffonts_scan(path):
     return rows, mismatch, text
 
 
-def diagnose(path):
-    info = pdfinfo(path)
-    rows, mismatch, _ = pdffonts_scan(path)
+def diagnose(path, password=None):
+    info = pdfinfo(path, password)
+    rows, mismatch, _ = pdffonts_scan(path, password)
     fonts = len(rows)
     has_cff = any("Type 0C" in r for r in rows)
     notes = []
@@ -227,6 +239,22 @@ def _stream_program_magic(data, dict_end, limit=16):
         return raw[:limit]
 
 
+def _sub_once(text, pattern, repl):
+    """只替换一次；未命中返回 (None, False)，避免"报告成功但没改"的静默失败。"""
+    new, n = re.subn(pattern, repl, text, count=1)
+    return (new if n == 1 else None), n == 1
+
+
+def _with_open_type_subtype(fdict):
+    """FontFile3 流字典补 /Subtype/OpenType（CFF 程序必须如此）。"""
+    if b"/Subtype/OpenType" in fdict:
+        return None
+    if b"/Subtype" in fdict:
+        new, ok = _sub_once(fdict, rb"/Subtype\s*/(?:Type1C|CIDFontType0C)", b"/Subtype/OpenType")
+        return new if ok else None
+    return fdict[:-2] + b"/Subtype/OpenType>>"
+
+
 def repair_font_declarations(src, dst):
     """修正「CFF 字体被声明成 TrueType 槽位」及反向错配，重建 xref。
 
@@ -245,11 +273,12 @@ def repair_font_declarations(src, dst):
         if ds is None:
             continue
         d = data[ds:de]
-        if (b"/FontFile2 " in d or b"/FontFile3 " in d) and b"/FontName" in d:
+        if re.search(rb"/FontFile[23]\s+\d+\s+0\s+R", d) and b"/FontName" in d:
             descriptors[num] = (ds, de, d)
 
     edits = []          # (start, end, replacement)
     explanations = []
+    skipped = []
 
     for num, (_, ds, de) in objs.items():
         if ds is None:
@@ -280,23 +309,38 @@ def repair_font_declarations(src, dst):
 
         # 情况 A：声明 TrueType 槽位，实际是 CFF 程序
         if declared == b"CIDFontType2" and slot == b"2" and is_cff:
-            edits.append((ds, de, d.replace(b"/Subtype/CIDFontType2", b"/Subtype/CIDFontType0", 1)))
-            edits.append((d_start, d_end, d_text.replace(
-                b"/FontFile2 %d 0 R" % fontfile_num, b"/FontFile3 %d 0 R" % fontfile_num, 1)))
-            fnum = fontfile_num
-            fdict_start, fdict_end = objs[fnum][1], objs[fnum][2]
-            fdict = data[fdict_start:fdict_end]
-            if b"/Subtype" not in fdict:
-                edits.append((fdict_start, fdict_end, fdict[:-2] + b"/Subtype/OpenType>>"))
+            new_d, ok1 = _sub_once(d, rb"/Subtype\s*/CIDFontType2", b"/Subtype/CIDFontType0")
+            new_desc, ok2 = _sub_once(
+                d_text, rb"/FontFile2\s+%d\s+0\s+R" % fontfile_num,
+                b"/FontFile3 %d 0 R" % fontfile_num)
+            if not (ok1 and ok2):
+                skipped.append(num)
+                continue
+            edits.append((ds, de, new_d))
+            edits.append((d_start, d_end, new_desc))
+            fdict_start, fdict_end = objs[fontfile_num][1], objs[fontfile_num][2]
+            new_fdict = _with_open_type_subtype(data[fdict_start:fdict_end])
+            if new_fdict is not None:
+                edits.append((fdict_start, fdict_end, new_fdict))
             explanations.append("obj %d: CIDFontType2/FontFile2(OTTO) -> CIDFontType0/FontFile3/OpenType" % num)
 
         # 情况 B：声明 CFF 槽位，实际是 TrueType 程序
         elif declared == b"CIDFontType0" and slot == b"3" and is_tt:
-            edits.append((ds, de, d.replace(b"/Subtype/CIDFontType0", b"/Subtype/CIDFontType2", 1)))
-            edits.append((d_start, d_end, d_text.replace(
-                b"/FontFile3 %d 0 R" % fontfile_num, b"/FontFile2 %d 0 R" % fontfile_num, 1)))
+            new_d, ok1 = _sub_once(d, rb"/Subtype\s*/CIDFontType0", b"/Subtype/CIDFontType2")
+            new_desc, ok2 = _sub_once(
+                d_text, rb"/FontFile3\s+%d\s+0\s+R" % fontfile_num,
+                b"/FontFile2 %d 0 R" % fontfile_num)
+            if not (ok1 and ok2):
+                skipped.append(num)
+                continue
+            edits.append((ds, de, new_d))
+            edits.append((d_start, d_end, new_desc))
             explanations.append("obj %d: CIDFontType0/FontFile3(TrueType) -> CIDFontType2/FontFile2" % num)
 
+    if skipped:
+        raise RuntimeError(
+            "字体声明写法无法安全替换（obj %s），已中止以免写出半修复文件；"
+            "请改用 --mode outline 或 --mode image" % ", ".join(map(str, skipped)))
     if not edits:
         raise RuntimeError("未发现需要修复的字体声明错配")
 
@@ -330,6 +374,19 @@ def _rebuild_xref(orig, body, objs):
     info = re.search(rb"/Info\s+(\d+)\s+0\s+R", trailer)
     ids = re.search(rb"/ID\s*\[(.*?)\]", trailer, re.S)
 
+    # 有些 PDF 使用交叉引用流、没有传统 trailer：从对象里找 /Type/Catalog 兜底
+    if not root:
+        for num, (_, ds, de) in _find_objects(body).items():
+            if ds is not None and b"/Type/Catalog" in body[ds:de]:
+                root = re.match(rb"", b"")
+                root_num = num
+                break
+        else:
+            raise RuntimeError("无法定位文档 /Root（可能使用特殊结构），已跳过原位修复；"
+                               "请改用 --mode outline 或 --mode image")
+    else:
+        root_num = int(root.group(1))
+
     offsets = {}
     for m in re.finditer(rb"(?m)^(\d+)\s+0\s+obj\b", body):
         offsets.setdefault(int(m.group(1)), m.start())
@@ -343,9 +400,7 @@ def _rebuild_xref(orig, body, objs):
         off = offsets.get(i)
         buf += (b"%010d 00000 n \n" % off) if off is not None else b"0000000000 00000 f \n"
 
-    parts = [b"<</Size %d" % size]
-    if root:
-        parts.append(b"/Root " + root.group(0).split(b"/Root ")[1])
+    parts = [b"<</Size %d/Root %d 0 R" % (size, root_num)]
     if info:
         parts.append(b"/Info " + info.group(0).split(b"/Info ")[1])
     if ids:
@@ -353,6 +408,40 @@ def _rebuild_xref(orig, body, objs):
     parts.append(b">>")
     buf += b"trailer\n" + b"".join(parts) + b"\nstartxref\n%d\n%%%%EOF\n" % xref_pos
     return bytes(buf)
+
+
+# --------------------------------------------------------------------------
+# 密码处理：优先环境变量，gs 用参数文件传递，避免出现在进程列表
+# --------------------------------------------------------------------------
+def _resolve_password(explicit=None):
+    return explicit or os.environ.get(PASSWORD_ENV) or None
+
+
+def _gs_password_args(password):
+    """把密码写进临时参数文件交给 gs，避免在 `ps aux` 里暴露。"""
+    if not password:
+        return [], None
+    try:
+        fd, path = tempfile.mkstemp(prefix="pdfnorm-pw-", suffix=".args")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("-sPDFPassword=" + password + "\n")
+        os.chmod(path, 0o600)
+        return ["@" + path], path
+    except Exception:
+        return ["-sPDFPassword=" + password], None
+
+
+def _prompt_password_on_error(err_text, password):
+    """仅当错误提示需要密码且终端可交互时，才提示输入一次。"""
+    if password or not sys.stdin.isatty():
+        return None
+    if "password" not in (err_text or "").lower():
+        return None
+    try:
+        import getpass
+        return getpass.getpass("该 PDF 需要密码，请输入（不回显）：") or None
+    except (EOFError, KeyboardInterrupt):
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -381,12 +470,22 @@ def build_outline(src, dst, password=None, lossy=False):
     args += [
         "-sOutputFile=" + str(dst),
     ]
-    if password:
-        args.append("-sPDFPassword=" + password)
+    pw_args, pw_file = _gs_password_args(password)
+    args += pw_args
     args.append(str(src))
-    rc, out, err = sh(args)
-    if rc != 0 or not Path(dst).exists() or Path(dst).stat().st_size == 0:
-        raise RuntimeError("Ghostscript 轮廓化失败: %s" % (err.strip() or out.strip())[-600:])
+    try:
+        rc, out, err = sh(args)
+        if rc != 0 or not Path(dst).exists() or Path(dst).stat().st_size == 0:
+            retry = _prompt_password_on_error(err, password)
+            if retry:
+                return build_outline(src, dst, retry, lossy)
+            raise RuntimeError("Ghostscript 轮廓化失败: %s" % (err.strip() or out.strip())[-600:])
+    finally:
+        if pw_file:
+            try:
+                os.unlink(pw_file)
+            except OSError:
+                pass
     return dst
 
 
@@ -424,86 +523,135 @@ def build_raster(src, dst, dpi=DEFAULT_DPI, quality=92, password=None):
         cmd += [str(src), os.path.join(td, "page")]
         rc, out, err = sh(cmd)
         if rc != 0:
+            retry = _prompt_password_on_error(err, password)
+            if retry:
+                return build_raster(src, dst, dpi, quality, retry)
             raise RuntimeError("pdftocairo 栅格化失败: %s" % (err.strip() or out.strip())[-600:])
         jpgs = sorted(Path(td).glob("page-*.jpg"),
                       key=lambda p: int(re.search(r"(\d+)$", p.stem).group(1)))
         if not jpgs:
             raise RuntimeError("pdftocairo 没有产生任何页面图片")
-        built = _build_image_pdf(jpgs, dst, dpi, page_size=page_size_pt(pdfinfo(src)))
+        built = _build_image_pdf(jpgs, dst, dpi, page_size=page_size_pt(pdfinfo(src, password)))
     return built
 
 
+def _jpeg_dimensions(path):
+    """只读文件头附近解析 JPEG 宽高；极端情况才整体读入。"""
+    with open(path, "rb") as fh:
+        head = fh.read(65536)
+    try:
+        return jpeg_size(head)
+    except RuntimeError:
+        return jpeg_size(Path(path).read_bytes())
+
+
 def _build_image_pdf(jpgs, dst, dpi, page_size=None):
-    """把每页 JPEG 打包成 PDF（无字体，DCTDecode）。"""
+    """把每页 JPEG 流式打包成 PDF（无字体，DCTDecode）。
+
+    逐页写盘，不把全部页面的 JPEG 同时留在内存；页面尺寸优先沿用原文档 pt 尺寸。
+    """
     pages = []
     for p in jpgs:
-        jpeg = Path(p).read_bytes()
-        w, h = jpeg_size(jpeg)
-        pages.append({"jpeg": jpeg, "pixels": (w, h)})
+        w, h = _jpeg_dimensions(p)
+        pages.append({"path": str(p), "pixels": (w, h), "size": os.path.getsize(p)})
 
-    # 页面尺寸：优先沿用原文档的 pt 尺寸，保证打印尺寸不变
     if page_size:
         size_w, size_h = page_size
-    else:
-        size_w, size_h = pages[0]["pixels"][0] * 72.0 / dpi, pages[0]["pixels"][1] * 72.0 / dpi
-        # 若各页像素尺寸不同，则逐页换算
-    uniform = page_size is not None and all(
-        abs(w * 72.0 / dpi - size_w) < 3 and abs(h * 72.0 / dpi - size_h) < 3
-        for w, h in (pg["pixels"] for pg in pages))
-    if not uniform:
-        page_size = None
+        uniform = all(
+            abs(w * 72.0 / dpi - size_w) < 3 and abs(h * 72.0 / dpi - size_h) < 3
+            for w, h in (pg["pixels"] for pg in pages))
+        if not uniform:
+            page_size = None
 
     n = len(pages)
     img_ids = [3 + i for i in range(n)]
     cont_ids = [3 + n + i for i in range(n)]
     page_ids = [3 + 2 * n + i for i in range(n)]
+    offsets = {}
 
-    buf = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offs = {}
+    out = open(dst, "wb")
+    try:
+        out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
 
-    def add(num, body):
-        offs[num] = len(buf)
-        buf.extend(b"%d 0 obj\n" % num + body + b"\nendobj\n")
+        def write_obj(num, head, stream_path=None):
+            offsets[num] = out.tell()
+            out.write(b"%d 0 obj\n" % num)
+            out.write(head)
+            if stream_path is not None:
+                out.write(b"stream\n")
+                with open(stream_path, "rb") as fh:
+                    shutil.copyfileobj(fh, out, 1 << 20)
+                out.write(b"\nendstream")
+            out.write(b"\nendobj\n")
 
-    add(1, b"<</Type/Catalog/Pages 2 0 R>>")
-    kids = b" ".join(b"%d 0 R" % p for p in page_ids)
-    add(2, b"<</Type/Pages/Count %d/Kids[%s]>>" % (n, kids))
+        write_obj(1, b"<</Type/Catalog/Pages 2 0 R>>")
+        kids = b" ".join(b"%d 0 R" % p for p in page_ids)
+        write_obj(2, b"<</Type/Pages/Count %d/Kids[%s]>>" % (n, kids))
 
-    for i, pg in enumerate(pages):
-        w, h = pg["pixels"]
-        if page_size:
-            pw, ph = page_size
-        else:
-            pw, ph = w * 72.0 / dpi, h * 72.0 / dpi
-        content = b"q %.4f 0 0 %.4f 0 0 cm /Im0 Do Q" % (pw, ph)
-        add(img_ids[i], b"<</Type/XObject/Subtype/Image/Width %d/Height %d"
-                        b"/ColorSpace/DeviceRGB/BitsPerComponent 8"
-                        b"/Filter/DCTDecode/Length %d>>" % (w, h, len(pg["jpeg"]))
-            + b"stream\n" + pg["jpeg"] + b"\nendstream")
-        add(cont_ids[i], b"<</Length %d>>stream\n" % len(content) + content + b"\nendstream")
-        add(page_ids[i], b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 %.4f %.4f]"
-                         b"/Resources<</XObject<</Im0 %d 0 R>>/ProcSet[/PDF/ImageC]>>"
-                         b"/Contents %d 0 R>>" % (pw, ph, img_ids[i], cont_ids[i]))
+        for i, pg in enumerate(pages):
+            w, h = pg["pixels"]
+            if page_size:
+                pw, ph = page_size
+            else:
+                pw, ph = w * 72.0 / dpi, h * 72.0 / dpi
+            head = (b"<</Type/XObject/Subtype/Image/Width %d/Height %d"
+                    b"/ColorSpace/DeviceRGB/BitsPerComponent 8"
+                    b"/Filter/DCTDecode/Length %d>>" % (w, h, pg["size"]))
+            write_obj(img_ids[i], head, pg["path"])
+            content = b"q %.4f 0 0 %.4f 0 0 cm /Im0 Do Q" % (pw, ph)
+            write_obj(cont_ids[i], b"<</Length %d>>stream\n" % len(content) + content + b"\nendstream")
+            write_obj(page_ids[i],
+                      b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 %.4f %.4f]"
+                      b"/Resources<</XObject<</Im0 %d 0 R>>/ProcSet[/PDF/ImageC]>>"
+                      b"/Contents %d 0 R>>" % (pw, ph, img_ids[i], cont_ids[i]))
 
-    size = max(offs) + 1
-    xref_pos = len(buf)
-    buf += b"xref\n0 %d\n" % size + b"0000000000 65535 f \n"
-    for i in range(1, size):
-        buf += (b"%010d 00000 n \n" % offs[i]) if i in offs else b"0000000000 00000 f \n"
-    buf += b"trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (size, xref_pos)
-    Path(dst).write_bytes(bytes(buf))
+        size = max(offsets) + 1
+        xref_pos = out.tell()
+        out.write(b"xref\n0 %d\n" % size + b"0000000000 65535 f \n")
+        for i in range(1, size):
+            out.write((b"%010d 00000 n \n" % offsets[i]) if i in offsets else b"0000000000 00000 f \n")
+        out.write(b"trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (size, xref_pos))
+    finally:
+        out.close()
     return dst
 
 
 # --------------------------------------------------------------------------
 # 校验：页数 + 逐页渲染比对
 # --------------------------------------------------------------------------
-def _render(pdf, dpi, outdir):
-    rc, out, err = sh(["pdftoppm", "-r", str(dpi), "-png", str(pdf), os.path.join(outdir, "p")])
+def _render(pdf, dpi, outdir, password=None):
+    cmd = ["pdftoppm", "-r", str(dpi), "-png"]
+    if password:
+        cmd += ["-upw", password]
+    cmd += [str(pdf), os.path.join(outdir, "p")]
+    rc, out, err = sh(cmd)
     if rc != 0:
         raise RuntimeError("pdftoppm 渲染失败: %s" % (err.strip() or out.strip())[-400:])
     return sorted(Path(outdir).glob("p-*.png"),
                   key=lambda p: int(re.search(r"(\d+)$", p.stem).group(1)))
+
+
+def _magick_compare(imgs_a, imgs_b):
+    """ImageMagick 后备：difference + blur + threshold，同时给出均值与差异像素占比。"""
+    if not have("magick") or len(imgs_a) != len(imgs_b):
+        return None
+    means, pcts = [], []
+    num_re = re.compile(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+    for a, b in zip(imgs_a, imgs_b):
+        base = [str(a), str(b), "-compose", "difference", "-composite",
+                "-colorspace", "Gray", "-blur", "0x1"]
+        rc, out, err = sh(["magick"] + base + ["-format", "%[fx:mean*255]", "info:"])
+        mean_txt = (out + err).strip()
+        if rc != 0 or not num_re.fullmatch(mean_txt):
+            return None
+        rc, out, err = sh(["magick"] + base + ["-threshold", "15%",
+                                               "-format", "%[fx:mean*100]", "info:"])
+        pct_txt = (out + err).strip()
+        if rc != 0 or not num_re.fullmatch(pct_txt):
+            return None
+        means.append(float(mean_txt))
+        pcts.append(float(pct_txt))
+    return sum(means) / len(means), sum(pcts) / len(pcts)
 
 
 def _compare(imgs_a, imgs_b):
@@ -514,17 +662,7 @@ def _compare(imgs_a, imgs_b):
         from PIL import Image, ImageChops, ImageFilter
         import numpy as np
     except Exception:
-        if not have("magick"):
-            return None
-        means, pcts = [], []
-        for a, b in zip(imgs_a, imgs_b):
-            rc, out, err = sh(["magick", "compare", "-metric", "RMSE", "-blur", "0x1", str(a), str(b), "null:"])
-            m = re.search(r"\(([\d.]+)\)", err + out)
-            if not m:
-                return None
-            v = float(m.group(1)) / 65535.0 * 255.0
-            means.append(v)
-        return (sum(means) / len(means), 0.0)
+        return _magick_compare(imgs_a, imgs_b)
     means, pcts = [], []
     for a, b in zip(imgs_a, imgs_b):
         ia = Image.open(a).convert("L")
@@ -540,6 +678,18 @@ def _compare(imgs_a, imgs_b):
     return sum(means) / len(means), sum(pcts) / len(pcts)
 
 
+def skipped_verify():
+    """--no-verify 时的校验结果：显式标记 skipped，不伪造 ok=true。"""
+    return {"skipped": True, "ok": None, "pages_ok": None, "fonts": None,
+            "reason": "跳过校验（--no-verify）"}
+
+
+def _verify_passed(v):
+    if not isinstance(v, dict):
+        return False
+    return v.get("skipped") is True or bool(v.get("ok"))
+
+
 def _verify_dpi(pages):
     if pages <= 10:
         return VERIFY_DPI
@@ -548,11 +698,11 @@ def _verify_dpi(pages):
     return 72
 
 
-def verify_output(src, out, mode, expect_fonts=0):
+def verify_output(src, out, mode, expect_fonts=0, src_password=None):
     """校验输出：页数一致、字体数符合预期、渲染内容与原件一致。"""
     res = {"pages_ok": False, "fonts": None, "verify": None, "ok": False, "reason": ""}
     try:
-        src_info, out_info = pdfinfo(src), pdfinfo(out)
+        src_info, out_info = pdfinfo(src, src_password), pdfinfo(out)
         src_pages = int(src_info.get("Pages", 0) or 0)
         out_pages = int(out_info.get("Pages", 0) or 0)
         res["pages_ok"] = src_pages == out_pages and out_pages > 0
@@ -571,7 +721,7 @@ def verify_output(src, out, mode, expect_fonts=0):
         with tempfile.TemporaryDirectory(prefix="pdfnorm-v-") as ta, \
              tempfile.TemporaryDirectory(prefix="pdfnorm-v-") as tb:
             dpi = _verify_dpi(out_pages)
-            ia = _render(src, dpi, ta)
+            ia = _render(src, dpi, ta, src_password)
             ib = _render(out, dpi, tb)
             cmp = _compare(ia, ib)
         if cmp is None:
@@ -624,52 +774,85 @@ def output_path(src, outdir, suffix, mode, dpi, force):
 def process_one(path, opts):
     path = Path(path)
     result = {"input": str(path), "ok": False, "mode": opts.mode, "outputs": [],
-              "diagnosis": None, "error": "", "verify": None}
+              "diagnosis": None, "error": "", "error_kind": "", "verify": None}
     try:
-        diag = diagnose(path)
+        try:
+            diag = diagnose(path, opts.password)
+        except RuntimeError as e:
+            if "password" in str(e).lower() and not opts.password and sys.stdin.isatty():
+                retry = _prompt_password_on_error(str(e), None)
+                if retry:
+                    opts.password = retry
+                    diag = diagnose(path, retry)
+                else:
+                    raise
+            else:
+                raise
         result["diagnosis"] = diag
         if opts.mode == "check":
             result["ok"] = True
             return result
 
-        mode = opts.mode
-        if mode == "auto":
-            mode = "outline"
+        skip = skipped_verify() if opts.no_verify else None
 
-        if mode == "outline":
+        def verified(pdf, mode, expect_fonts):
+            if skip is not None:
+                return skip
+            return verify_output(path, pdf, mode, expect_fonts=expect_fonts,
+                                 src_password=opts.password)
+
+        if opts.mode in ("outline", "auto"):
             dst = output_path(path, opts.out, opts.suffix, "outline", opts.dpi, opts.force)
-            build_outline(path, dst, opts.password, opts.lossy_images)
-            ver = verify_output(path, dst, "outline", expect_fonts=0) if not opts.no_verify else {"ok": True, "fonts": 0}
-            result["outputs"].append(str(dst))
-            result["verify"] = ver
-            result["mode"] = "outline"
-            if opts.no_verify or ver["ok"]:
-                result["ok"] = True
-            elif opts.mode == "auto":
-                # 轮廓化校验不过 -> 自动退化为栅格
+            outline_problem = None
+            ver = None
+            try:
+                build_outline(path, dst, opts.password, opts.lossy_images)
+                ver = verified(dst, "outline", 0)
+            except RuntimeError as e:
+                if opts.mode == "outline":
+                    raise
+                outline_problem = str(e)
+            if ver is not None and _verify_passed(ver):
+                result.update(ok=True, mode="outline", outputs=[str(dst)], verify=ver)
+                return result
+            if opts.mode == "outline":
+                if dst.exists():
+                    result["outputs"].append(str(dst))
+                result["verify"] = ver
+                result["error"] = "校验未通过：%s" % (ver.get("reason", "") if ver else outline_problem)
+                result["error_kind"] = "verify"
+                return result
+
+            # auto：轮廓化抛错或校验不过 -> 降级栅格化
+            if dst.exists():
                 dst.unlink(missing_ok=True)
-                result["outputs"].clear()
-                img = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
-                build_raster(path, img, opts.dpi, opts.jpeg_quality, opts.password)
-                ver2 = verify_output(path, img, "image", expect_fonts=0) if not opts.no_verify else {"ok": True}
-                result["outputs"].append(str(img))
-                result["verify"] = ver2
-                result["ok"] = ver2.get("ok", False)
-                result["mode"] = "image"
-                if not result["ok"]:
-                    result["error"] = "自动模式：轮廓化与栅格化均未通过校验（%s）" % ver2.get("reason", "")
-            else:
-                result["error"] = "校验未通过：%s" % ver["reason"]
-        elif mode == "image":
+            img = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
+            build_raster(path, img, opts.dpi, opts.jpeg_quality, opts.password)
+            ver2 = verified(img, "image", 0)
+            result.update(mode="image", outputs=[str(img)], verify=ver2)
+            result["ok"] = _verify_passed(ver2)
+            if not result["ok"]:
+                reasons = []
+                if outline_problem:
+                    reasons.append("轮廓化失败: %s" % outline_problem)
+                elif ver is not None:
+                    reasons.append("轮廓化校验未通过: %s" % ver.get("reason", ""))
+                reasons.append("栅格化校验未通过: %s" % ver2.get("reason", ""))
+                result["error"] = "自动模式：轮廓化与栅格化均未通过（%s）" % "；".join(reasons)
+                result["error_kind"] = "verify"
+            return result
+
+        if opts.mode == "image":
             dst = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
             build_raster(path, dst, opts.dpi, opts.jpeg_quality, opts.password)
-            ver = verify_output(path, dst, "image", expect_fonts=0) if not opts.no_verify else {"ok": True, "fonts": 0}
-            result["outputs"].append(str(dst))
-            result["verify"] = ver
-            result["ok"] = bool(ver["ok"])
+            ver = verified(dst, "image", 0)
+            result.update(outputs=[str(dst)], verify=ver, ok=_verify_passed(ver))
             if not result["ok"]:
                 result["error"] = "校验未通过：%s" % ver.get("reason", "")
-        elif mode == "fix":
+                result["error_kind"] = "verify"
+            return result
+
+        if opts.mode == "fix":
             dst = output_path(path, opts.out, opts.suffix, "fix", opts.dpi, opts.force)
             try:
                 n, explain = repair_font_declarations(path, dst)
@@ -685,51 +868,81 @@ def process_one(path, opts):
             result["fix"] = {"fixed": n, "explanations": explain,
                              "mismatch_before": diag["mismatch"], "mismatch_after": after_mismatch,
                              "fonts_after": len(after_rows)}
-            ver = verify_output(path, dst, "fix", expect_fonts=None) if not opts.no_verify else {"ok": True, "fonts": len(after_rows)}
+            ver = verified(dst, "fix", None)
             result["verify"] = ver
-            result["ok"] = after_mismatch == 0 and bool(ver.get("ok"))
+            result["ok"] = after_mismatch == 0 and _verify_passed(ver)
             if after_mismatch:
                 result["error"] = "仍存在 %d 处字体错配" % after_mismatch
-            elif not ver.get("ok"):
+                result["error_kind"] = "verify"
+            elif not _verify_passed(ver):
                 result["error"] = "校验未通过：%s" % ver.get("reason", "")
-        elif mode == "both":
+                result["error_kind"] = "verify"
+            return result
+
+        if opts.mode == "both":
             dst1 = output_path(path, opts.out, opts.suffix, "outline", opts.dpi, opts.force)
-            build_outline(path, dst1, opts.password, opts.lossy_images)
-            ver1 = verify_output(path, dst1, "outline", expect_fonts=0) if not opts.no_verify else {"ok": True}
-            result["outputs"].append(str(dst1))
+            try:
+                build_outline(path, dst1, opts.password, opts.lossy_images)
+                ver1 = verified(dst1, "outline", 0)
+            except Exception:
+                if dst1.exists():
+                    dst1.unlink(missing_ok=True)
+                raise
             dst2 = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
-            build_raster(path, dst2, opts.dpi, opts.jpeg_quality, opts.password)
-            ver2 = verify_output(path, dst2, "image", expect_fonts=0) if not opts.no_verify else {"ok": True}
-            result["outputs"].append(str(dst2))
+            try:
+                build_raster(path, dst2, opts.dpi, opts.jpeg_quality, opts.password)
+                ver2 = verified(dst2, "image", 0)
+            except Exception:
+                if dst2.exists():
+                    dst2.unlink(missing_ok=True)
+                raise
+            result["outputs"] = [str(dst1), str(dst2)]
             result["verify"] = {"outline": ver1, "image": ver2}
-            result["ok"] = bool(ver1.get("ok")) and bool(ver2.get("ok"))
+            result["ok"] = _verify_passed(ver1) and _verify_passed(ver2)
             if not result["ok"]:
                 result["error"] = "部分输出未通过校验"
-        else:
-            result["error"] = "未知模式: %s" % mode
-    except Exception as e:
+                result["error_kind"] = "verify"
+            return result
+
+        result["error"] = "未知模式: %s" % opts.mode
+        result["error_kind"] = "usage"
+    except RuntimeError as e:
         result["error"] = str(e)
+        result["error_kind"] = "usage"
+    except Exception as e:
+        result["error"] = "%s: %s" % (type(e).__name__, e)
+        result["error_kind"] = "usage"
     return result
 
 
 # --------------------------------------------------------------------------
 # 文件收集 / 报告
 # --------------------------------------------------------------------------
-def collect_inputs(paths, recursive):
+def _generated_patterns(suffix):
+    """本工具可能生成的文件名模式（扫描目录时跳过，避免把产物当输入）。"""
+    patterns = []
+    for sfx in {suffix, DEFAULT_SUFFIX}:
+        if not sfx:
+            continue
+        patterns.append(re.compile(r"%s(?:-fix|-\d+dpi)?(?:-\d+)?$" % re.escape(sfx)))
+    return patterns
+
+
+def collect_inputs(paths, recursive, suffix=DEFAULT_SUFFIX):
     files, errors = [], []
     for p in paths:
         p = Path(p).expanduser()
         if not p.exists():
             errors.append("文件不存在: %s" % p)
         elif p.is_dir():
-            pattern = "**/*.pdf" if recursive else "*.pdf"
-            found = sorted(p.glob(pattern))
+            candidates = p.glob("**/*") if recursive else p.glob("*")
+            found = sorted(x for x in candidates if x.is_file() and x.suffix.lower() == ".pdf")
             if not found:
                 errors.append("目录下没有 PDF: %s" % p)
             files.extend(found)
         else:
             files.append(p)
-    # 去重、排除本工具生成的产物
+    generated = _generated_patterns(suffix)
     seen, out = set(), []
     for f in files:
         rp = f.resolve()
@@ -738,7 +951,7 @@ def collect_inputs(paths, recursive):
         if f.suffix.lower() != ".pdf":
             errors.append("跳过非 PDF 文件: %s" % f)
             continue
-        if re.search(r"(-print(-\d+dpi|-fix)?|-\d+print(-\d+dpi)?)$", f.stem):
+        if any(pat.search(f.stem) for pat in generated):
             continue
         seen.add(rp)
         out.append(f)
@@ -759,14 +972,18 @@ def fmt_diag(d):
 
 
 def _print_verify(label, v):
+    prefix = (" " + label) if label else ""
+    if v.get("skipped"):
+        print("  校验%s: 跳过（--no-verify）" % prefix)
+        return
     if v.get("verify"):
         vv = v["verify"]
         print("  校验%s: 页数%s，字体 %s 个，渲染差 均值 %.2f / 差异像素 %.2f%%  %s"
-              % ((" " + label) if label else "",
+              % (prefix,
                  "一致" if v.get("pages_ok") else "不一致", v.get("fonts"),
                  vv["mean"], vv["pct"], "✓" if v["ok"] else "✗"))
     elif v.get("reason"):
-        print("  校验%s: %s" % ((" " + label) if label else "", v["reason"]))
+        print("  校验%s: %s" % (prefix, v["reason"]))
 
 
 def print_result(r, opts):
@@ -854,7 +1071,8 @@ def build_parser():
     p.add_argument("--no-verify", action="store_true", help="跳过输出后的渲染校验（更快）")
     p.add_argument("--lossy-images", action="store_true",
                    help="轮廓化时允许图片有损转存（照片多的文件体积更小）")
-    p.add_argument("--password", help="加密 PDF 的密码")
+    p.add_argument("--password",
+                   help="加密 PDF 的密码（也可用环境变量 %s，避免进入 shell 历史）" % PASSWORD_ENV)
     p.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     p.add_argument("-q", "--quiet", action="store_true", help="只输出错误")
     p.add_argument("--doctor", action="store_true", help="检查依赖环境")
@@ -891,7 +1109,8 @@ def main(argv=None):
                                                           ".".join(map(str, MIN_GS))),
                   file=sys.stderr)
 
-    files, errors = collect_inputs(opts.inputs, opts.recursive)
+    opts.password = _resolve_password(opts.password)
+    files, errors = collect_inputs(opts.inputs, opts.recursive, opts.suffix)
     for e in errors:
         print("警告: %s" % e, file=sys.stderr)
     if not files:
@@ -921,8 +1140,9 @@ def main(argv=None):
 
     if not failed:
         return EXIT_OK
+    kinds = {r.get("error_kind") or "usage" for r in failed}
     if len(failed) == len(results):
-        return EXIT_VERIFY if any(r["error"].startswith("校验") for r in failed) else EXIT_USAGE
+        return EXIT_VERIFY if kinds == {"verify"} else EXIT_USAGE
     return EXIT_PARTIAL
 
 

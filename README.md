@@ -44,7 +44,7 @@ cd pdf-normalization
 ./install.sh            # 装成全局命令 pdf-normalize
 ```
 
-也可以不安装，直接 `./pdf-normalize` 使用；或 `pipx install .`（需要 Python 3.8+）。
+也可以不安装，直接 `./pdf-normalize` 使用；或 `pipx install .`（需要 Python 3.10+）。
 
 ```bash
 pdf-normalize --doctor   # 自检（含 gs / poppler 版本下限检查）

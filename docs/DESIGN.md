@@ -299,8 +299,11 @@ gs -q -dNOPAUSE -dBATCH -dSAFER \
 2. 元数据、书签会丢失（打印无影响）；
 3. `fix` 模式对 `ObjStm` 结构的 PDF 不可用（提示改用 outline/image）；
 4. 极端异常的 PDF（损坏 xref、gs 不支持的滤镜）可能两边都失败；
+   `fix` 模式对无传统 trailer（交叉引用流）的 PDF 已能兜底定位 Root，但仍不支持对象流（ObjStm）；
 5. 颜色空间（专色/CMYK）与出血、装订等印刷级需求不在范围内；
-6. 校验的「渲染一致」应理解为**视觉一致**，不是字节级等价。
+6. 校验的「渲染一致」应理解为**视觉一致**，不是字节级等价；
+7. 加密 PDF 的密码在 `--mode image` 下仍会以 argv 传给 `pdftocairo`（poppler 无参数文件机制），
+   `--mode outline` 已改用临时参数文件；建议统一用环境变量 `PDF_NORMALIZE_PASSWORD` 传入。
 
 ---
 

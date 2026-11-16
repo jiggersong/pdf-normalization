@@ -2,6 +2,32 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.1] - 2026-11-16
+
+### 修复（依据 WorkBuddy 代码审查，记录见 `code-review/`）
+
+- **P0** `fix` 模式：字体声明识别与回写统一改用正则，支持 `/Subtype /CIDFontType2`、
+  `/FontFile2  9 0 R`、换行等真实写法；无法安全替换时中止并提示，不再“报告修复成功但未改”
+  或产生 `CIDFontType2 + FontFile3` 之类的新错配。
+- **P1** 校验：ImageMagick 后备分支同时计算灰度均值与显著差异像素占比，不再恒为 0。
+- **P1** 加密 PDF：密码支持环境变量 `PDF_NORMALIZE_PASSWORD`；gs 通过临时参数文件传递密码，
+  避免出现在进程列表；pdfinfo / pdffonts / pdftoppm 全链路支持密码并给出明确提示。
+- **P1** 批量：自定义 `--suffix` 的产物不再被当作输入重复处理。
+- **P1** 退出码：改用结构化 `error_kind` 判定；`auto` 两级校验都失败时按文档返回 2。
+- **P1** `--no-verify`：JSON 中显式标记 `skipped: true`、`ok/fonts: null`，不再伪造校验通过。
+- **P2** 目录扫描支持 `.PDF` 等大写扩展名。
+- **P2** 栅格化图片 PDF 改为流式写盘，降低大文档内存占用。
+- 额外：无传统 trailer（交叉引用流）时从 `/Type/Catalog` 兜底定位 Root；`auto` 在轮廓化
+  进程失败时也会按文档承诺降级为图片。
+
+### 依赖
+
+- Python 要求调整为 **3.10+**（3.8/3.9 已 EOL），与 CI 的 3.10/3.12 矩阵一致。
+
+### 文档
+
+- 更新 `docs/USAGE.md`、`DEPENDENCIES.md`、`README.md`；新增 `code-review/` 审查与修改记录。
+
 ## [1.0.0] - 2026-11-16
 
 ### 新增

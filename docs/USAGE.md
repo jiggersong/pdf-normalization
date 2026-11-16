@@ -72,7 +72,7 @@ cd pdf-normalization
 ./pdf-normalize --help
 ```
 
-方式 C：用 pipx / pip 安装（需要 Python 3.8+）
+方式 C：用 pipx / pip 安装（需要 Python 3.10+）
 
 ```bash
 pipx install .          # 或： python3 -m pip install --user .
@@ -119,7 +119,7 @@ pdf-normalize [选项] <文件或目录>...
 | `-f, --force` | 允许覆盖已存在的输出 | 关 |
 | `--suffix S` | 输出文件名后缀 | `-print` |
 | `--no-verify` | 跳过输出后的渲染校验（更快） | 关 |
-| `--password PW` | 加密 PDF 的密码 | — |
+| `--password PW` | 加密 PDF 的密码；也可用环境变量 `PDF_NORMALIZE_PASSWORD`（避免进入 shell 历史） | 读环境变量 |
 | `--json` | 以 JSON 输出结果（含诊断与校验数据） | 关 |
 | `-q, --quiet` | 只输出错误 | 关 |
 | `--doctor` | 环境自检 | — |
@@ -204,15 +204,16 @@ pdf-normalize -r -o 打印版/ ~/Documents/简历/
 # 覆盖已存在的输出
 pdf-normalize -f 简历.pdf
 
-# 自定义后缀
-pdf-normalize --suffix -可打印 简历.pdf     # 简历-可打印.pdf
+# 自定义后缀（注意：以 - 开头的值要用 --suffix=xxx 写法）
+pdf-normalize --suffix=-可打印 简历.pdf     # 简历-可打印.pdf
 ```
 
 规则：
 
 - 输入文件**永远不会被修改**；
 - 默认输出到源文件所在目录，同名文件已存在时自动加 `-2`、`-3`（`-f` 强制覆盖）；
-- 目录扫描只处理 `*.pdf`，并自动跳过本工具生成的文件（`-print`、`-print-300dpi`、`-print-fix`）。
+- 目录扫描只处理 PDF（扩展名大小写均可，`.PDF` 也识别），并自动跳过本工具生成的文件
+  （`<后缀>`、`<后缀>-300dpi`、`<后缀>-fix`；自定义 `--suffix` 同样生效）。
 
 ---
 
@@ -234,7 +235,8 @@ pdf-normalize --suffix -可打印 简历.pdf     # 简历-可打印.pdf
 
 校验通过会打印 `校验: 页数一致，字体 0 个，渲染差 均值 1.60 / 差异像素 0.03% ✓`。
 不通过则以非 0 退出码结束（`auto` 会自动降级重试）。
-只信页数/字体数、不在意渲染比对时可用 `--no-verify` 提速。
+只信页数/字体数、不在意渲染比对时可用 `--no-verify` 提速；此时 JSON 里 `verify.skipped` 为 `true`、
+`verify.ok`/`verify.fonts` 为 `null`，机器消费者可区分「跳过」与「通过」。
 
 ---
 
