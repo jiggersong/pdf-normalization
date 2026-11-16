@@ -6,6 +6,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$HERE/pdf-normalize"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+exec 0</dev/null   # 隔离 stdin：避免交互式密码提示让测试挂起
 FAIL=0
 
 say()  { printf '%s\n' "$*"; }
@@ -88,6 +89,8 @@ if gs -q -dNOPAUSE -dBATCH -sDEVICE=pdfwrite -sOwnerPassword=owner -sUserPasswor
     && ok "环境变量密码可解锁并转换" || bad "环境变量密码失败"
   "$BIN" --mode outline -o "$TMP/enc2" "$TMP/enc.pdf" >/dev/null 2>&1 \
     && bad "无密码时不应成功" || ok "无密码时失败并提示"
+  "$BIN" --no-input --mode outline -o "$TMP/enc3" "$TMP/enc.pdf" >/dev/null 2>&1 \
+    && bad "--no-input 下无密码不应成功" || ok "--no-input 下快速失败（不等待输入）"
 else
   say "  - 当前 gs 不支持加密参数，跳过"
 fi

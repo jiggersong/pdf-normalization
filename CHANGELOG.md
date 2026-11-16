@@ -2,6 +2,25 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.2] - 2026-11-16
+
+### 修复（依据 WorkBuddy 第二轮审查）
+
+- **高** `make test` 在交互终端会被密码提示挂起：冒烟测试隔离 stdin（`exec 0</dev/null`），
+  并新增 `--no-input` / `PDF_NORMALIZE_NO_PROMPT=1` 显式关闭交互式提示。
+- **中** 加密 PDF 改为「先用 Ghostscript 解密到 0600 临时文件」，后续 `pdfinfo`/`pdffonts`/
+  `pdftoppm`/`pdftocairo` 全部免密处理；仅在 gs 缺失或解密失败时回退 poppler `-upw`，
+  文档（DESIGN §11 / USAGE §8.4）如实说明残余风险。
+- **中** 密码错误时区分提示「密码错误」而不是「未提供密码」。
+- **低** `_rebuild_xref()` 的 Root 兜底改为 `_find_catalog_object()` + `root_num`，去掉占位
+  `re.match(rb"", b"")` 写法。
+
+### 测试
+
+- 新增「--no-input 禁止交互」「加密 PDF 解密到临时文件并清理」单元测试；
+- 冒烟新增「--no-input 下快速失败（不等待输入）」；
+- 在伪终端（pty）下执行 `make test` 通过，不再挂起。
+
 ## [1.0.1] - 2026-11-16
 
 ### 修复（依据 WorkBuddy 代码审查，记录见 `code-review/`）

@@ -41,7 +41,7 @@ import tempfile
 import zlib
 from pathlib import Path
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 DEFAULT_DPI = 300
 DEFAULT_SUFFIX = "-print"
 PASSWORD_ENV = "PDF_NORMALIZE_PASSWORD"
@@ -125,7 +125,10 @@ def pdfinfo(path, password=None):
     if rc != 0:
         msg = err.strip() or out.strip()
         if "password" in msg.lower():
-            msg += "（该 PDF 已加密：用 --password 或环境变量 %s 提供密码）" % PASSWORD_ENV
+            if password:
+                msg += "（密码错误，或该 PDF 使用了不支持的加密方式）"
+            else:
+                msg += "（该 PDF 已加密：用 --password 或环境变量 %s 提供密码）" % PASSWORD_ENV
         raise RuntimeError("pdfinfo 失败: %s" % msg)
     info = {}
     for line in out.splitlines():
@@ -365,27 +368,30 @@ def _object_end(data, num):
     return end + len(b"endobj") if end != -1 else len(data)
 
 
+def _find_catalog_object(body):
+    """在对象里查找 /Type/Catalog 的对象号，找不到返回 None。"""
+    for num, (_, ds, de) in _find_objects(body).items():
+        if ds is not None and b"/Type/Catalog" in body[ds:de]:
+            return num
+    return None
+
+
 def _rebuild_xref(orig, body, objs):
     """用修复后的对象偏移重建经典 xref 表（保留 Root/Info/ID）。"""
     trailer = b""
     for m in re.finditer(rb"trailer\s*<<(.*?)>>", orig, re.S):
         trailer = m.group(1)
-    root = re.search(rb"/Root\s+(\d+)\s+0\s+R", trailer)
     info = re.search(rb"/Info\s+(\d+)\s+0\s+R", trailer)
     ids = re.search(rb"/ID\s*\[(.*?)\]", trailer, re.S)
 
-    # 有些 PDF 使用交叉引用流、没有传统 trailer：从对象里找 /Type/Catalog 兜底
-    if not root:
-        for num, (_, ds, de) in _find_objects(body).items():
-            if ds is not None and b"/Type/Catalog" in body[ds:de]:
-                root = re.match(rb"", b"")
-                root_num = num
-                break
-        else:
-            raise RuntimeError("无法定位文档 /Root（可能使用特殊结构），已跳过原位修复；"
-                               "请改用 --mode outline 或 --mode image")
-    else:
-        root_num = int(root.group(1))
+    root_match = re.search(rb"/Root\s+(\d+)\s+0\s+R", trailer)
+    root_num = int(root_match.group(1)) if root_match else None
+    if root_num is None:
+        # 有些 PDF 使用交叉引用流、没有传统 trailer：从对象里找 /Type/Catalog 兜底
+        root_num = _find_catalog_object(body)
+    if root_num is None:
+        raise RuntimeError("无法定位文档 /Root（可能使用特殊结构），已跳过原位修复；"
+                           "请改用 --mode outline 或 --mode image")
 
     offsets = {}
     for m in re.finditer(rb"(?m)^(\d+)\s+0\s+obj\b", body):
@@ -417,6 +423,16 @@ def _resolve_password(explicit=None):
     return explicit or os.environ.get(PASSWORD_ENV) or None
 
 
+_NO_PROMPT = False
+
+
+def _resolve_no_prompt(flag):
+    """--no-input 或 PDF_NORMALIZE_NO_PROMPT 生效时，禁止任何交互式提示。"""
+    global _NO_PROMPT
+    env = os.environ.get("PDF_NORMALIZE_NO_PROMPT", "").strip().lower()
+    _NO_PROMPT = bool(flag) or env in ("1", "true", "yes", "on")
+
+
 def _gs_password_args(password):
     """把密码写进临时参数文件交给 gs，避免在 `ps aux` 里暴露。"""
     if not password:
@@ -432,8 +448,8 @@ def _gs_password_args(password):
 
 
 def _prompt_password_on_error(err_text, password):
-    """仅当错误提示需要密码且终端可交互时，才提示输入一次。"""
-    if password or not sys.stdin.isatty():
+    """仅当错误提示需要密码、终端可交互、且未禁用交互时，才提示输入一次。"""
+    if _NO_PROMPT or password or not sys.stdin.isatty():
         return None
     if "password" not in (err_text or "").lower():
         return None
@@ -442,6 +458,46 @@ def _prompt_password_on_error(err_text, password):
         return getpass.getpass("该 PDF 需要密码，请输入（不回显）：") or None
     except (EOFError, KeyboardInterrupt):
         return None
+
+
+def _decrypt_source(src, password):
+    """用 gs 把加密 PDF 解密到 0600 临时文件，返回 (路径, 待清理路径) 或 None。
+
+    解密后 poppler 工具链（pdfinfo/pdffonts/pdftoppm/pdftocairo）不再需要密码，
+    密码只出现在 gs 的临时参数文件里，不会进入任何进程的 argv。
+    """
+    if not password or not have("gs"):
+        return None
+    fd, tmp = tempfile.mkstemp(prefix="pdfnorm-dec-", suffix=".pdf")
+    os.close(fd)
+    pw_args, pw_file = _gs_password_args(password)
+    args = ["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-dPDFSTOPONERROR",
+            "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            "-sOutputFile=" + tmp] + pw_args + [str(src)]
+    try:
+        rc, out, err = sh(args)
+    finally:
+        if pw_file:
+            try:
+                os.unlink(pw_file)
+            except OSError:
+                pass
+    text = (err + "\n" + out).lower()
+    bad = any(k in text for k in ("password", "decrypt", "couldn't initialise file"))
+    ok = rc == 0 and not bad and Path(tmp).exists() and Path(tmp).stat().st_size > 0
+    if ok:
+        try:
+            # 确认确实解密成功（无密码可读，且至少有 1 页）
+            ok = int(pdfinfo(tmp).get("Pages", 0) or 0) >= 1
+        except Exception:
+            ok = False
+    if not ok:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+    return Path(tmp), tmp
 
 
 # --------------------------------------------------------------------------
@@ -775,38 +831,51 @@ def process_one(path, opts):
     path = Path(path)
     result = {"input": str(path), "ok": False, "mode": opts.mode, "outputs": [],
               "diagnosis": None, "error": "", "error_kind": "", "verify": None}
+    work_path = path          # 实际处理用的源文件（加密 PDF 会先解密到临时文件）
+    cleanup = None            # 需要清理的临时文件
     try:
         try:
-            diag = diagnose(path, opts.password)
+            diag = diagnose(work_path)
         except RuntimeError as e:
-            if "password" in str(e).lower() and not opts.password and sys.stdin.isatty():
-                retry = _prompt_password_on_error(str(e), None)
-                if retry:
-                    opts.password = retry
-                    diag = diagnose(path, retry)
-                else:
-                    raise
-            else:
+            msg = str(e)
+            if "password" not in msg.lower():
                 raise
+            if not opts.password:
+                retry = _prompt_password_on_error(msg, None)
+                if not retry:
+                    raise
+                opts.password = retry
+            if opts.mode == "fix":
+                raise RuntimeError("加密 PDF 不支持 --mode fix（会改变加密状态）；"
+                                   "请改用 --mode outline 或 --mode image")
+            decrypted = _decrypt_source(path, opts.password)
+            if decrypted is None:
+                # gs 不可用或解密失败：退回 poppler 的 -upw（密码会出现在进程 argv）
+                diag = diagnose(path, opts.password)
+            else:
+                work_path, cleanup = decrypted
+                diag = diagnose(work_path)
+        diag["path"] = str(path)
         result["diagnosis"] = diag
         if opts.mode == "check":
             result["ok"] = True
             return result
 
+        tool_password = None if cleanup else opts.password
         skip = skipped_verify() if opts.no_verify else None
 
         def verified(pdf, mode, expect_fonts):
             if skip is not None:
                 return skip
-            return verify_output(path, pdf, mode, expect_fonts=expect_fonts,
-                                 src_password=opts.password)
+            return verify_output(work_path, pdf, mode, expect_fonts=expect_fonts,
+                                 src_password=tool_password)
 
         if opts.mode in ("outline", "auto"):
             dst = output_path(path, opts.out, opts.suffix, "outline", opts.dpi, opts.force)
             outline_problem = None
             ver = None
             try:
-                build_outline(path, dst, opts.password, opts.lossy_images)
+                build_outline(work_path, dst, tool_password, opts.lossy_images)
                 ver = verified(dst, "outline", 0)
             except RuntimeError as e:
                 if opts.mode == "outline":
@@ -827,7 +896,7 @@ def process_one(path, opts):
             if dst.exists():
                 dst.unlink(missing_ok=True)
             img = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
-            build_raster(path, img, opts.dpi, opts.jpeg_quality, opts.password)
+            build_raster(work_path, img, opts.dpi, opts.jpeg_quality, tool_password)
             ver2 = verified(img, "image", 0)
             result.update(mode="image", outputs=[str(img)], verify=ver2)
             result["ok"] = _verify_passed(ver2)
@@ -844,7 +913,7 @@ def process_one(path, opts):
 
         if opts.mode == "image":
             dst = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
-            build_raster(path, dst, opts.dpi, opts.jpeg_quality, opts.password)
+            build_raster(work_path, dst, opts.dpi, opts.jpeg_quality, tool_password)
             ver = verified(dst, "image", 0)
             result.update(outputs=[str(dst)], verify=ver, ok=_verify_passed(ver))
             if not result["ok"]:
@@ -855,7 +924,7 @@ def process_one(path, opts):
         if opts.mode == "fix":
             dst = output_path(path, opts.out, opts.suffix, "fix", opts.dpi, opts.force)
             try:
-                n, explain = repair_font_declarations(path, dst)
+                n, explain = repair_font_declarations(work_path, dst)
             except RuntimeError as e:
                 if "未发现需要修复的字体声明错配" in str(e):
                     result["ok"] = True
@@ -882,7 +951,7 @@ def process_one(path, opts):
         if opts.mode == "both":
             dst1 = output_path(path, opts.out, opts.suffix, "outline", opts.dpi, opts.force)
             try:
-                build_outline(path, dst1, opts.password, opts.lossy_images)
+                build_outline(work_path, dst1, tool_password, opts.lossy_images)
                 ver1 = verified(dst1, "outline", 0)
             except Exception:
                 if dst1.exists():
@@ -890,7 +959,7 @@ def process_one(path, opts):
                 raise
             dst2 = output_path(path, opts.out, opts.suffix, "image", opts.dpi, opts.force)
             try:
-                build_raster(path, dst2, opts.dpi, opts.jpeg_quality, opts.password)
+                build_raster(work_path, dst2, opts.dpi, opts.jpeg_quality, tool_password)
                 ver2 = verified(dst2, "image", 0)
             except Exception:
                 if dst2.exists():
@@ -912,6 +981,12 @@ def process_one(path, opts):
     except Exception as e:
         result["error"] = "%s: %s" % (type(e).__name__, e)
         result["error_kind"] = "usage"
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
     return result
 
 
@@ -1073,6 +1148,8 @@ def build_parser():
                    help="轮廓化时允许图片有损转存（照片多的文件体积更小）")
     p.add_argument("--password",
                    help="加密 PDF 的密码（也可用环境变量 %s，避免进入 shell 历史）" % PASSWORD_ENV)
+    p.add_argument("--no-input", action="store_true",
+                   help="禁止任何交互式输入（脚本/CI 用；等价于环境变量 PDF_NORMALIZE_NO_PROMPT=1）")
     p.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     p.add_argument("-q", "--quiet", action="store_true", help="只输出错误")
     p.add_argument("--doctor", action="store_true", help="检查依赖环境")
@@ -1110,6 +1187,7 @@ def main(argv=None):
                   file=sys.stderr)
 
     opts.password = _resolve_password(opts.password)
+    _resolve_no_prompt(opts.no_input)
     files, errors = collect_inputs(opts.inputs, opts.recursive, opts.suffix)
     for e in errors:
         print("警告: %s" % e, file=sys.stderr)

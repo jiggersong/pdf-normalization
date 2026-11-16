@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf-normalize"
-version = "1.0.1"
+version = "1.0.2"
 description = "把「一打印就乱码」的 PDF 规范化成任何打印机都能打印的文件（零字体版）"
 readme = "README.md"
 requires-python = ">=3.10"

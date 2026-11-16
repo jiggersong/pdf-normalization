@@ -243,6 +243,49 @@ def test_exit_codes(mod, tmpdir):
     print("  ✓ 退出码：全校验失败=2，部分失败=3")
 
 
+def test_no_input_and_decrypt(mod, tmpdir):
+    """--no-input 禁止交互；加密 PDF 可先解密到临时文件供后续工具链免密处理。"""
+    import shutil
+    import subprocess
+
+    # 1) --no-input 解析与全局开关
+    opts = mod.build_parser().parse_args(["--no-input", "x.pdf"])
+    assert opts.no_input is True
+    mod._resolve_no_prompt(True)
+    try:
+        assert mod._prompt_password_on_error("This file requires a password", None) is None
+    finally:
+        mod._resolve_no_prompt(False)
+    print("  ✓ --no-input 禁止交互式提示")
+
+    # 2) gs 解密到临时文件（无 gs 则跳过）
+    if not (shutil.which("gs") and shutil.which("pdfinfo")):
+        print("  - 跳过解密测试（未安装 gs/pdfinfo）")
+        return
+    plain = Path(tmpdir) / "plain.pdf"
+    enc = Path(tmpdir) / "enc.pdf"
+    plain.write_bytes(make_pdf(b"CIDFontType2", b"/FontFile2", b"\x00\x01\x00\x00" + b"\x00" * 64))
+    rc = subprocess.run([
+        "gs", "-q", "-dNOPAUSE", "-dBATCH", "-sDEVICE=pdfwrite",
+        "-sOwnerPassword=owner", "-sUserPassword=user",
+        "-dEncryptionR=3", "-dKeyLength=128",
+        "-sOutputFile=" + str(enc), str(plain),
+    ]).returncode
+    if rc != 0:
+        print("  - 当前 gs 不支持加密参数，跳过解密测试")
+        return
+    got = mod._decrypt_source(enc, "user")
+    assert got is not None, "解密失败"
+    dec_path, cleanup = got
+    try:
+        mod.pdfinfo(dec_path)  # 无密码应可读
+        assert dec_path != enc
+    finally:
+        Path(cleanup).unlink(missing_ok=True)
+    assert not Path(cleanup).exists()
+    print("  ✓ 加密 PDF 解密到临时文件并清理")
+
+
 def test_noop(mod, tmpdir):
     src = Path(tmpdir) / "ok.pdf"
     dst = Path(tmpdir) / "ok_fixed.pdf"
@@ -269,6 +312,7 @@ def main():
         test_skip_verify_semantics(mod, td)
         test_collect_inputs_suffix(mod, td)
         test_exit_codes(mod, td)
+        test_no_input_and_decrypt(mod, td)
         test_magick_compare(mod, td)
         test_noop(mod, td)
     print("单元测试全部通过")

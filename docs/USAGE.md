@@ -120,6 +120,7 @@ pdf-normalize [选项] <文件或目录>...
 | `--suffix S` | 输出文件名后缀 | `-print` |
 | `--no-verify` | 跳过输出后的渲染校验（更快） | 关 |
 | `--password PW` | 加密 PDF 的密码；也可用环境变量 `PDF_NORMALIZE_PASSWORD`（避免进入 shell 历史） | 读环境变量 |
+| `--no-input` | 禁止交互式输入（脚本/CI 用；等价 `PDF_NORMALIZE_NO_PROMPT=1`） | 关 |
 | `--json` | 以 JSON 输出结果（含诊断与校验数据） | 关 |
 | `-q, --quiet` | 只输出错误 | 关 |
 | `--doctor` | 环境自检 | — |
@@ -299,7 +300,14 @@ pdf-normalize --mode image --dpi 200 扫描件.pdf   # 200 dpi 足够，体积�
 
 ```bash
 pdf-normalize --password 你的密码 加密文件.pdf
+# 或（推荐，避免密码进入 shell 历史）
+PDF_NORMALIZE_PASSWORD=你的密码 pdf-normalize 加密文件.pdf
+# 脚本/CI 中显式禁止交互提示
+pdf-normalize --no-input 加密文件.pdf
 ```
+
+实现说明：默认先用 gs 解密到 0600 临时文件，后续 poppler 工具全部免密调用；
+仅当 gs 缺失/解密失败时才回退为 poppler 的 `-upw`。`--mode fix` 不支持加密 PDF。
 
 ### 8.5 把结果交给别人
 
