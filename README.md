@@ -1,5 +1,9 @@
 # pdf-normalize
 
+[![CI](https://github.com/jiggersong/pdf-normalization/actions/workflows/ci.yml/badge.svg)](https://github.com/jiggersong/pdf-normalization/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/jiggersong/pdf-normalization)](https://github.com/jiggersong/pdf-normalization/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > 把「一打印就乱码」的 PDF 规范化成任何打印机都能打印的文件。
 
 很多中文 PDF（WPS、macOS 导出工具等生成）在屏幕上完全正常，打印出来却是乱码：
