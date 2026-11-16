@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# 产物与本地环境
+.DS_Store
+demo-output/
+*.log
+build/
+dist/
+*.egg-info/
+.venv/
+.pytest_cache/

@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""pdf-normalize 命令行入口。
+
+真正的实现位于同目录的 pdf_normalize.py，这里只负责把它挂到 PATH 上的
+执行入口（同时兼容 `pip install .` 安装出的 console_scripts）。
+"""
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from pdf_normalize import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main())

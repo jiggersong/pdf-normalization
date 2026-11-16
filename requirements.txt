@@ -1,0 +1,4 @@
+# pdf-normalize 只使用 Python 标准库，无第三方 Python 运行时依赖。
+# 本文件保留为空清单，方便 pip install -r requirements.txt 等自动化流程。
+#
+# 系统级依赖（Ghostscript、poppler）见 DEPENDENCIES.md 或 Brewfile。
